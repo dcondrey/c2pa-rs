@@ -152,9 +152,29 @@ pub fn save_jumbf_to_memory(asset_type: &str, data: &[u8], store_bytes: &[u8]) -
 
 #[cfg(feature = "file_io")]
 pub(crate) fn get_assetio_handler_from_path(asset_path: &Path) -> Option<&dyn AssetIO> {
-    let ext = get_file_extension(asset_path)?;
+    let ext = get_file_extension(asset_path).unwrap_or_default();
 
-    CAI_READERS.get(&ext).map(|h| h.as_ref())
+    if let Some(h) = CAI_READERS.get(&ext) {
+        return Some(h.as_ref());
+    }
+
+    // if not found by extension, try to detect from content
+    if let Some(format) = detect_format_from_path(asset_path) {
+        if let Some(h) = CAI_READERS.get(&format) {
+            return Some(h.as_ref());
+        }
+    }
+
+    None
+}
+
+#[cfg(feature = "file_io")]
+fn detect_format_from_path(path: &Path) -> Option<String> {
+    fs::File::open(path).ok().and_then(|mut file| {
+        let mut buffer = [0u8; 512];
+        let n = file.read(&mut buffer).ok()?;
+        crate::utils::mime::get_mime_from_bytes(&buffer[..n]).map(|m| m.to_string())
+    })
 }
 
 pub(crate) fn get_assetio_handler(ext: &str) -> Option<&dyn AssetIO> {
@@ -186,13 +206,19 @@ pub(crate) fn get_file_extension(path: &Path) -> Option<String> {
 
 #[cfg(feature = "file_io")]
 pub(crate) fn get_supported_file_extension(path: &Path) -> Option<String> {
-    let ext = get_file_extension(path)?;
-
-    if CAI_READERS.get(&ext).is_some() {
-        Some(ext)
-    } else {
-        None
+    if let Some(ext) = get_file_extension(path) {
+        if CAI_READERS.get(&ext).is_some() {
+            return Some(ext);
+        }
     }
+
+    // try to detect from content
+    if let Some(format) = detect_format_from_path(path) {
+        if CAI_READERS.get(&format).is_some() {
+            return Some(format);
+        }
+    }
+    None
 }
 
 /// Returns a [Vec<String>] of supported mime types for reading manifests.

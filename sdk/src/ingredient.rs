@@ -549,8 +549,10 @@ impl Ingredient {
             .to_lowercase();
 
         let format = extension_to_mime(&extension)
-            .unwrap_or("application/octet-stream")
-            .to_owned();
+            .map(|m| m.to_owned())
+            .or_else(|| crate::jumbf_io::detect_format_from_path(path))
+            .unwrap_or_else(|| "application/octet-stream".to_owned());
+
         (title, extension, format)
     }
 
