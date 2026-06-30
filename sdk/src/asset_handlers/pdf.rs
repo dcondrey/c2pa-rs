@@ -11,9 +11,6 @@
 // specific language governing permissions and limitations under
 // each license.
 
-// TODO: Remove this after we finish the PDF write feature.
-#![allow(dead_code)]
-
 use std::io::{Read, Write};
 
 use lopdf::{
@@ -33,6 +30,8 @@ static EMBEDDED_FILES_KEY: &[u8] = b"EmbeddedFiles";
 static SUBTYPE_KEY: &[u8] = b"Subtype";
 static TYPE_KEY: &[u8] = b"Type";
 static NAMES_KEY: &[u8] = b"Names";
+// PDF keyword that immediately precedes a stream object's content bytes.
+static STREAM_KEYWORD: &[u8] = b"stream";
 
 /// Error representing failure scenarios while interacting with PDFs.
 #[derive(Debug, Error)]
@@ -47,6 +46,7 @@ pub enum Error {
     NoManifest,
 
     /// Error occurred while adding a C2PA manifest as an `Annotation` to the PDF.
+    #[allow(dead_code)] // used by the annotation embedding path
     #[error("Unable to add C2PA manifest as an annotation to the PDF.")]
     AddingAnnotation,
 
@@ -78,6 +78,7 @@ pub(crate) trait C2paPdf: Sized {
     fn write_manifest_as_embedded_file(&mut self, bytes: Vec<u8>) -> Result<(), Error>;
 
     /// Writes provided `bytes` as a PDF `Annotation`.
+    #[allow(dead_code)] // spec-allowed alternative to the embedded-file path used by the writer
     fn write_manifest_as_annotation(&mut self, vec: Vec<u8>) -> Result<(), Error>;
 
     /// Returns a reference to the C2PA manifest bytes.
@@ -191,6 +192,7 @@ impl C2paPdf for Pdf {
 
     /// Writes the provided bytes to the PDF as a `FileAttachment` `Annotation`. This `Annotation`
     /// is added to the first page of the `PDF`, to the lower left corner.
+    #[allow(dead_code)] // spec-allowed alternative to the embedded-file path used by the writer
     fn write_manifest_as_annotation(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let file_stream_reference = self.add_c2pa_embedded_file_stream(bytes);
         let file_spec_reference = self.add_embedded_file_specification(file_stream_reference);
@@ -308,6 +310,95 @@ impl Pdf {
         Ok(Self { document })
     }
 
+    /// Returns the byte range `(offset, length)` of the embedded C2PA manifest
+    /// stream's content within `raw` — the serialized bytes this [`Pdf`] was
+    /// loaded from — or `None` if no C2PA manifest is embedded.
+    ///
+    /// Unlike JPEG/PNG, where the manifest is spliced at a predictable offset,
+    /// `lopdf` re-serializes the entire object graph on save, so the manifest's
+    /// location is only knowable after serialization. The offset is resolved
+    /// from the cross-reference table (the authoritative object → byte-offset
+    /// map) plus the `stream` keyword that follows the object dictionary, then
+    /// verified byte-for-byte against the parsed stream content. A mismatch
+    /// returns `None` so a caller never hashes over an incorrect exclusion range.
+    pub(crate) fn c2pa_manifest_content_range(&self, raw: &[u8]) -> Option<(usize, usize)> {
+        let file_spec_id = self.c2pa_file_spec_object_id()?;
+
+        // /Filespec -> /EF -> /F : indirect reference to the embedded file stream.
+        let ef_dict = self
+            .document
+            .get_object(file_spec_id)
+            .and_then(Object::as_dict)
+            .and_then(|dict| dict.get_deref(b"EF", &self.document))
+            .and_then(Object::as_dict)
+            .ok()?;
+        let stream_id = ef_dict.get(b"F").and_then(Object::as_reference).ok()?;
+
+        let content = &self
+            .document
+            .get_object(stream_id)
+            .and_then(Object::as_stream)
+            .ok()?
+            .content;
+        let length = content.len();
+
+        // Authoritative object byte offset from the cross-reference table.
+        let obj_offset = match self.document.reference_table.get(stream_id.0)? {
+            lopdf::xref::XrefEntry::Normal { offset, .. } => *offset as usize,
+            _ => return None,
+        };
+        let region = raw.get(obj_offset..)?;
+
+        // Stream content begins after the `stream` keyword and its EOL marker.
+        let rel = region
+            .windows(STREAM_KEYWORD.len())
+            .position(|window| window == STREAM_KEYWORD)?;
+        let mut start = obj_offset + rel + STREAM_KEYWORD.len();
+        if raw.get(start) == Some(&b'\r') {
+            start += 1;
+        }
+        if raw.get(start) == Some(&b'\n') {
+            start += 1;
+        }
+
+        // Verify the resolved range matches the parsed content exactly.
+        let end = start.checked_add(length)?;
+        if raw.get(start..end)? != content.as_slice() {
+            return None;
+        }
+
+        Some((start, length))
+    }
+
+    /// Replaces the content of the existing embedded C2PA manifest stream in
+    /// place, preserving the object's identity and the document's structure.
+    ///
+    /// This is used to finalize a placeholder manifest with the signed bytes.
+    /// When the replacement has the same length as the placeholder, the
+    /// re-serialized document is byte-identical outside the manifest content,
+    /// which is what keeps the C2PA data-hash binding valid.
+    pub(crate) fn replace_manifest_bytes(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
+        let file_spec_id = self.c2pa_file_spec_object_id().ok_or(Error::NoManifest)?;
+
+        // /Filespec -> /EF -> /F : indirect reference to the embedded file stream.
+        let stream_id = {
+            let ef = self
+                .document
+                .get_object(file_spec_id)?
+                .as_dict()?
+                .get_deref(b"EF", &self.document)?
+                .as_dict()?;
+            ef.get(b"F")?.as_reference()?
+        };
+
+        self.document
+            .get_object_mut(stream_id)?
+            .as_stream_mut()?
+            .set_content(bytes);
+
+        Ok(())
+    }
+
     /// Returns a reference to the Associated Files array from the PDF's Catalog.
     fn associated_files(&self) -> Result<&Vec<Object>, Error> {
         Ok(self
@@ -366,6 +457,7 @@ impl Pdf {
     /// The `FileAttachment` annotation is added to the first page of the PDF in the lower
     /// left-hand corner. The `FileAttachment`'s location is not defined in the spec as of version
     /// `1.3`.
+    #[allow(dead_code)] // used by the annotation embedding path
     fn add_file_attachment_annotation(
         &mut self,
         file_spec_reference: ObjectId,
